@@ -29,13 +29,19 @@ export class QueueService {
   }
 
   private setupRedis(): void {
-    const redisConfig = {
-      socket: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379'),
-      },
-      password: process.env.REDIS_PASSWORD || undefined,
-    };
+    let redisConfig: any;
+    
+    if (process.env.REDIS_URL) {
+      redisConfig = { url: process.env.REDIS_URL };
+    } else {
+      redisConfig = {
+        socket: {
+          host: process.env.REDIS_HOST || 'localhost',
+          port: parseInt(process.env.REDIS_PORT || '6379'),
+        },
+        password: process.env.REDIS_PASSWORD || undefined,
+      };
+    }
 
     this.redis = createClient(redisConfig);
     
@@ -49,14 +55,21 @@ export class QueueService {
   }
 
   private setupQueue(): void {
-    const redisConfig: any = {
-      host: process.env.REDIS_HOST || 'localhost',
-      port: parseInt(process.env.REDIS_PORT || '6379'),
-    };
-
-    // Only add password if it exists
-    if (process.env.REDIS_PASSWORD) {
-      redisConfig.password = process.env.REDIS_PASSWORD;
+    let redisConfig: any;
+    
+    if (process.env.REDIS_URL) {
+      // Bull expects Redis URL in a specific format
+      redisConfig = process.env.REDIS_URL;
+    } else {
+      redisConfig = {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: parseInt(process.env.REDIS_PORT || '6379'),
+      };
+      
+      // Only add password if it exists
+      if (process.env.REDIS_PASSWORD) {
+        redisConfig.password = process.env.REDIS_PASSWORD;
+      }
     }
 
     this.qaQueue = new Bull('qa-processing', {
