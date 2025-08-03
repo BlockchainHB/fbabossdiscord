@@ -3,6 +3,7 @@ import { PineconeService, PineconeMatch } from './pinecone';
 import { DiscordDatabaseService } from './discord-database';
 import { NamespaceRouter } from './namespace-router';
 import { supabase } from '../config/database';
+import { MEMORY_MESSAGE_LIMIT } from '../config/discord';
 import logger from '../utils/logger';
 
 export interface QARequest {
@@ -10,6 +11,7 @@ export interface QARequest {
   userId: string;
   guildId?: string;
   channelId?: string;
+  threadId?: string;
   contextMemory?: boolean;
   language?: string;
   customSystemPrompt?: string;
@@ -59,111 +61,131 @@ export class QAPipelineService {
     let embeddingTokens = 0;
     let promptTokens = 0;
     let completionTokens = 0;
+    const maxRetries = 3;
+    let attempt = 0;
 
-    try {
-      logger.info(`Processing question from user ${request.userId}: ${request.question}`);
+    while (attempt < maxRetries) {
+      try {
+        attempt++;
+        logger.info(`Processing question from user ${request.userId} (attempt ${attempt}/${maxRetries}): ${request.question}`);
 
-      // Step 1: Improve question quality
-      const improvedQuestion = await this.improveQuestion(request.question);
-      logger.debug(`Improved question: ${improvedQuestion}`);
+        // Step 1: Improve question quality with retry logic
+        const improvedQuestion = await this.improveQuestionWithRetry(request.question);
+        logger.debug(`Improved question: ${improvedQuestion}`);
 
-      // Step 2: Route question to relevant namespaces
-      const routing = await this.router.routeQuestion(improvedQuestion);
-      logger.debug(`Routed to namespaces: ${routing.namespaces.join(', ')}`);
-      logger.debug(`Routing confidence: ${routing.confidence}`);
+        // Step 2: Route question to relevant namespaces
+        const routing = await this.router.routeQuestion(improvedQuestion);
+        logger.debug(`Routed to namespaces: ${routing.namespaces.join(', ')}`);
+        logger.debug(`Routing confidence: ${routing.confidence}`);
 
-      // Step 3: Create embedding for the question
-      const questionEmbedding = await this.openai.createEmbedding(improvedQuestion);
-      embeddingTokens += this.openai.estimateTokenCount(improvedQuestion);
+        // Step 3: Create embedding for the question
+        const questionEmbedding = await this.openai.createEmbedding(improvedQuestion);
+        embeddingTokens += this.openai.estimateTokenCount(improvedQuestion);
 
-      // Step 4: Search for relevant content in Pinecone using routed namespaces
-      const searchResults = await this.pinecone.searchSimilar(questionEmbedding, {
-        topK: 5,
-        minScore: 0.02, // Lowered threshold based on actual score ranges
-        namespaces: routing.namespaces
-        // Removed contentTypes filter as metadata doesn't contain this field
-      });
+        // Step 4: Search for relevant content in Pinecone using routed namespaces
+        const searchResults = await this.pinecone.searchSimilar(questionEmbedding, {
+          topK: 5,
+          minScore: 0.02,
+          namespaces: routing.namespaces
+        });
 
-      logger.debug(`Found ${searchResults.length} relevant documents`);
+        logger.debug(`Found ${searchResults.length} relevant documents`);
 
-      // Step 5: Get conversation context if enabled
-      let conversationContext = '';
-      let conversationId: string | undefined = undefined;
-      
-      if (request.contextMemory && request.guildId) {
-        const context = await this.getConversationContext(request.userId, request.guildId);
-        conversationContext = context.context;
-        conversationId = context.conversationId;
-      }
-
-      // Step 6: Prepare context from search results
-      const documentContext = this.prepareDocumentContext(searchResults);
-
-      // Step 7: Generate answer using OpenAI
-      const answerResponse = await this.generateAnswer(
-        request.question,
-        documentContext,
-        conversationContext,
-        {
-          language: request.language || 'en',
-          customSystemPrompt: request.customSystemPrompt || undefined
+        // Step 5: Get conversation context if enabled
+        let conversationContext = '';
+        let conversationId: string | undefined = undefined;
+        
+        if (request.contextMemory && request.guildId) {
+          const context = await this.getConversationContext(
+            request.userId, 
+            request.guildId, 
+            request.channelId,
+            request.threadId
+          );
+          conversationContext = context.context;
+          conversationId = context.conversationId;
         }
-      );
 
-      promptTokens += answerResponse.usage.prompt_tokens;
-      completionTokens += answerResponse.usage.completion_tokens;
+        // Step 6: Prepare context from search results
+        const documentContext = this.prepareDocumentContext(searchResults);
 
-      // Step 8: Validate answer quality
-      const validation = await this.openai.validateAnswer(
-        request.question,
-        answerResponse.content,
-        documentContext
-      );
-
-      // Step 9: Store conversation if context memory is enabled
-      if (request.contextMemory && request.guildId && request.channelId) {
-        await this.storeConversation(
-          request,
-          answerResponse.content,
-          conversationId || undefined
+        // Step 7: Generate answer using OpenAI
+        const answerResponse = await this.generateAnswer(
+          request.question,
+          documentContext,
+          conversationContext,
+          {
+            language: request.language || 'en',
+            customSystemPrompt: request.customSystemPrompt || undefined
+          }
         );
-      }
 
-      // Step 10: Log usage for analytics
-      await this.logUsage(request, {
-        promptTokens,
-        completionTokens,
-        embeddingTokens,
-        processingTime: Date.now() - startTime,
-        resultsCount: searchResults.length,
-        confidence: validation.confidence
-      });
+        promptTokens += answerResponse.usage.prompt_tokens;
+        completionTokens += answerResponse.usage.completion_tokens;
 
-      const processingTime = Date.now() - startTime;
+        // Step 8: Validate answer quality
+        const validation = await this.openai.validateAnswer(
+          request.question,
+          answerResponse.content,
+          documentContext
+        );
 
-      return {
-        answer: answerResponse.content,
-        confidence: validation.confidence,
-        sources: searchResults.map(result => ({
-          title: result.metadata.title || 'Untitled',
-          content: result.metadata.description || result.metadata.text || '',
-          score: result.score,
-          metadata: result.metadata
-        })),
-        usage: {
+        // Step 9: Store conversation if context memory is enabled
+        if (request.contextMemory && request.guildId && request.channelId) {
+          await this.storeConversation(
+            request,
+            answerResponse.content,
+            conversationId || undefined
+          );
+        }
+
+        // Step 10: Log usage for analytics
+        await this.logUsage(request, {
           promptTokens,
           completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          embeddingTokens
-        },
-        processingTime,
-        conversationId
-      };
+          embeddingTokens,
+          processingTime: Date.now() - startTime,
+          resultsCount: searchResults.length,
+          confidence: validation.confidence
+        });
 
-    } catch (error) {
-      logger.error('Error processing question:', error);
-      throw error;
+        const processingTime = Date.now() - startTime;
+
+        return {
+          answer: answerResponse.content,
+          confidence: validation.confidence,
+          sources: searchResults.map(result => ({
+            title: result.metadata.title || 'Untitled',
+            content: result.metadata.description || result.metadata.text || '',
+            score: result.score,
+            metadata: result.metadata
+          })),
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            embeddingTokens
+          },
+          processingTime,
+          conversationId
+        };
+
+      } catch (error) {
+        logger.error(`Error processing question (attempt ${attempt}/${maxRetries}):`, error);
+        
+        if (attempt === maxRetries) {
+          // Final attempt failed, throw the error
+          throw new Error(`Failed to process question after ${maxRetries} attempts: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+        
+        // Wait before retrying (exponential backoff)
+        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+        logger.info(`Retrying in ${delayMs}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
     }
+
+    throw new Error('Unexpected end of retry loop');
   }
 
   private async improveQuestion(question: string): Promise<string> {
@@ -176,9 +198,32 @@ export class QAPipelineService {
     }
   }
 
+  private async improveQuestionWithRetry(question: string, maxRetries: number = 2): Promise<string> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const improvement = await this.openai.improveQuestion(question);
+        return improvement.content || question;
+      } catch (error) {
+        logger.warn(`Failed to improve question (attempt ${attempt}/${maxRetries}):`, error);
+        
+        if (attempt === maxRetries) {
+          logger.warn('All attempts to improve question failed, using original');
+          return question;
+        }
+        
+        // Short delay before retry
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    return question;
+  }
+
   private async getConversationContext(
     userId: string,
-    guildId: string
+    guildId: string,
+    channelId?: string,
+    threadId?: string
   ): Promise<{ context: string; conversationId?: string }> {
     try {
       const discordUser = await this.dbService.getUser(userId);
@@ -186,7 +231,13 @@ export class QAPipelineService {
         return { context: '' };
       }
 
-      const conversations = await this.dbService.getUserConversations(userId, guildId);
+      // Look for thread-specific conversation first if threadId is provided
+      let conversations;
+      if (threadId) {
+        conversations = await this.dbService.getThreadConversations(userId, guildId, threadId);
+      } else {
+        conversations = await this.dbService.getUserConversations(userId, guildId);
+      }
       
       if (conversations.length === 0) {
         return { context: '' };
@@ -197,23 +248,29 @@ export class QAPipelineService {
         return { context: '' };
       }
       
-      // Get recent messages from the conversation
+      // Get recent messages from the conversation with enhanced limit
       const { data: messages } = await supabase
         .from('messages')
-        .select('role, content')
+        .select('role, content, created_at')
         .eq('conversation_id', recentConversation.conversation_id)
         .order('created_at', { ascending: false })
-        .limit(6);
+        .limit(MEMORY_MESSAGE_LIMIT);
 
       if (!messages || messages.length === 0) {
         return { context: '', conversationId: recentConversation.conversation_id };
       }
 
-      // Format context from recent messages
+      // Format context from recent messages with intelligent summarization
       const contextMessages = messages
         .reverse()
-        .map(msg => `${msg.role}: ${msg.content}`)
-        .join('\n');
+        .map((msg, index) => {
+          // Add timestamps for better context understanding
+          const timeAgo = this.getTimeAgo(new Date(msg.created_at));
+          return `${msg.role} (${timeAgo}): ${msg.content}`;
+        })
+        .join('\n\n');
+
+      logger.debug(`Retrieved ${messages.length} messages for conversation context (limit: ${MEMORY_MESSAGE_LIMIT})`);
 
       return {
         context: contextMessages,
@@ -223,6 +280,16 @@ export class QAPipelineService {
       logger.error('Error getting conversation context:', error);
       return { context: '' };
     }
+  }
+
+  private getTimeAgo(date: Date): string {
+    const now = new Date();
+    const diffInSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
+    
+    if (diffInSeconds < 60) return 'just now';
+    if (diffInSeconds < 3600) return `${Math.floor(diffInSeconds / 60)}m ago`;
+    if (diffInSeconds < 86400) return `${Math.floor(diffInSeconds / 3600)}h ago`;
+    return `${Math.floor(diffInSeconds / 86400)}d ago`;
   }
 
   private prepareDocumentContext(searchResults: PineconeMatch[]): string {
@@ -311,6 +378,7 @@ ${documentContext}`;
           conversation_id: conversationId!,
           guild_id: request.guildId!,
           channel_id: request.channelId!,
+          thread_id: request.threadId || undefined,
           discord_user_id: request.userId
         });
       }

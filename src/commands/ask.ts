@@ -51,25 +51,33 @@ export default {
         return;
       }
 
+      // Determine if we're in a thread
+      const channel = interaction.channel;
+      const isThread = channel?.type === 11 || channel?.type === 12; // PrivateThread or PublicThread
+      const threadId = isThread ? channel?.id : undefined;
+      const parentChannelId = isThread ? channel?.parentId : channel?.id;
+
       // Add job to queue
       const jobId = await queueService.addQAJob({
         question,
         userId: interaction.user.id,
         guildId: interaction.guild?.id || undefined,
-        channelId: interaction.channel?.id || undefined,
+        channelId: parentChannelId || undefined,
+        threadId: threadId,
         contextMemory: true,
         language: 'en'
       });
 
-      // Show initial processing message
+      // Show initial processing message with typing indicator
       const processingEmbed = new EmbedBuilder()
         .setColor(0x0099FF)
         .setTitle('🔍 Question Received')
-        .setDescription('Searching through FBA course content for your answer...')
+        .setDescription('🤔 Analyzing your question and searching through FBA course content...\n\n*This may take 5-15 seconds*')
         .addFields(
-          { name: '❓ Your Question', value: question, inline: false }
+          { name: '❓ Your Question', value: question, inline: false },
+          { name: '🧠 Processing Steps', value: '1. ✅ Question received\n2. ⏳ Analyzing context\n3. ⏳ Searching knowledge base\n4. ⏳ Generating response', inline: false }
         )
-        .setFooter({ text: 'Expected response time: 5-15 seconds' })
+        .setFooter({ text: 'FBA Boss Assistant is thinking...' })
         .setTimestamp();
 
       await interaction.editReply({ embeds: [processingEmbed] });

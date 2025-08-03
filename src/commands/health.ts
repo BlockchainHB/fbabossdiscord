@@ -1,7 +1,7 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { Command } from '../types/command';
 import { QAPipelineService } from '../services/qa-pipeline';
-import { QueueService } from '../services/queue';
+import { SimpleQueueService } from '../services/simple-queue';
 import logger from '../utils/logger';
 
 export default {
@@ -18,7 +18,7 @@ export default {
       
       // Initialize services
       const qaPipeline = new QAPipelineService();
-      const queueService = new QueueService();
+      const queueService = new SimpleQueueService();
 
       // Check system health
       const [healthStatus, queueStats] = await Promise.all([

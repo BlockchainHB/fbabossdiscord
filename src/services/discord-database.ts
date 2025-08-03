@@ -284,6 +284,20 @@ export class DiscordDatabaseService {
     return data;
   }
 
+  async getThreadConversations(userId: string, guildId: string, threadId: string): Promise<DiscordConversation[]> {
+    const { data, error } = await supabase
+      .from('discord_conversations')
+      .select('*')
+      .eq('discord_user_id', userId)
+      .eq('guild_id', guildId)
+      .eq('thread_id', threadId)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    if (error) throw error;
+    return data || [];
+  }
+
   async getDiscordConversation(conversationId: string): Promise<DiscordConversation | null> {
     const { data, error } = await supabase
       .from('discord_conversations')

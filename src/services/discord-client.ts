@@ -7,10 +7,13 @@ import {
   User, 
   ChatInputCommandInteraction,
   AutocompleteInteraction,
+  ButtonInteraction,
+  ModalSubmitInteraction,
   InteractionType,
-  Interaction
+  Interaction,
+  ChannelType
 } from 'discord.js';
-import { createDiscordClient, DISCORD_TOKEN } from '../config/discord';
+import { createDiscordClient, DISCORD_TOKEN, PRODUCTION_CHANNEL_ID } from '../config/discord';
 import { DiscordDatabaseService } from './discord-database';
 import { Command, CommandCollection } from '../types/command';
 import logger from '../utils/logger';
@@ -55,6 +58,10 @@ export class DiscordClientService {
         await this.handleSlashCommand(interaction);
       } else if (interaction.type === InteractionType.ApplicationCommandAutocomplete && interaction.isAutocomplete()) {
         await this.handleAutocomplete(interaction);
+      } else if (interaction.type === InteractionType.MessageComponent && interaction.isButton()) {
+        await this.handleButtonInteraction(interaction);
+      } else if (interaction.type === InteractionType.ModalSubmit && interaction.isModalSubmit()) {
+        await this.handleModalSubmit(interaction);
       }
     } catch (error) {
       logger.error('Error handling interaction:', error);
@@ -71,6 +78,16 @@ export class DiscordClientService {
           content: 'There was an error while executing this command!',
           ephemeral: true
         });
+      } else if (interaction.isButton() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: 'There was an error processing your request!',
+          ephemeral: true
+        });
+      } else if (interaction.isModalSubmit() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: 'There was an error processing your submission!',
+          ephemeral: true
+        });
       }
     }
   }
@@ -83,7 +100,14 @@ export class DiscordClientService {
       return;
     }
 
-    // Rate limiting is handled in the queue service for individual commands
+    // Check if command is restricted to production channel or its threads
+    if (!this.isChannelAllowed(interaction)) {
+      await interaction.reply({
+        content: '❌ This command can only be used in the designated support channel or its threads.',
+        ephemeral: true
+      });
+      return;
+    }
 
     // Sync user to database
     await this.syncUserToDatabase(interaction.user);
@@ -105,6 +129,304 @@ export class DiscordClientService {
     }
 
     await command.autocomplete(interaction);
+  }
+
+  private async handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
+    const customId = interaction.customId;
+
+    switch (customId) {
+      case 'ask_followup':
+        await this.handleFollowUpButton(interaction);
+        break;
+      case 'ask_clarify':
+        await this.handleClarifyButton(interaction);
+        break;
+      case 'ask_sources':
+        await this.handleSourcesButton(interaction);
+        break;
+      default:
+        await interaction.reply({
+          content: '❌ Unknown button interaction.',
+          ephemeral: true
+        });
+    }
+  }
+
+  private async handleFollowUpButton(interaction: ButtonInteraction): Promise<void> {
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = await import('discord.js');
+    
+    const modal = new ModalBuilder()
+      .setCustomId('followup_modal')
+      .setTitle('Ask a Follow-up Question');
+
+    const questionInput = new TextInputBuilder()
+      .setCustomId('followup_question')
+      .setLabel('Your follow-up question')
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder('Ask a related question for more details...')
+      .setRequired(true)
+      .setMaxLength(500);
+
+    const actionRow = new ActionRowBuilder<any>().addComponents(questionInput);
+    modal.addComponents(actionRow);
+
+    await interaction.showModal(modal);
+  }
+
+  private async handleClarifyButton(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferReply({ ephemeral: true });
+
+    const originalMessage = interaction.message;
+    const originalEmbed = originalMessage.embeds[0];
+    
+    // Try to extract the original question from embed fields first
+    let originalQuestion = originalEmbed?.fields?.find(field => field.name === '❓ Your Question')?.value;
+    
+    // If not found in fields, try to extract from embed description or title
+    if (!originalQuestion && originalEmbed) {
+      // Look for question patterns in the description
+      const description = originalEmbed.description || '';
+      const mentionMatch = description.match(/<@\d+>\s*(.*)/);
+      if (mentionMatch && mentionMatch[1]) {
+        originalQuestion = mentionMatch[1].substring(0, 200); // Limit length
+      } else if (description.length > 0) {
+        originalQuestion = description.substring(0, 200);
+      }
+    }
+    
+    // If still no question found, use a generic clarification prompt
+    const clarificationPrompt = originalQuestion 
+      ? `Please provide a more detailed explanation for this question: "${originalQuestion}". Include specific examples and step-by-step guidance where applicable.`
+      : `Please provide a more detailed explanation based on the previous conversation context. Include specific examples and step-by-step guidance where applicable.`;
+
+    // Import QA services
+    const { SimpleQueueService } = await import('./simple-queue');
+    const queueService = new SimpleQueueService();
+
+    try {
+      // Determine if we're in a thread
+      const channel = interaction.channel;
+      const isThread = channel?.type === ChannelType.PrivateThread || channel?.type === ChannelType.PublicThread;
+      const threadId = isThread ? channel?.id : undefined;
+      const parentChannelId = isThread ? channel?.parentId : channel?.id;
+
+      const jobId = await queueService.addQAJob({
+        question: clarificationPrompt,
+        userId: interaction.user.id,
+        guildId: interaction.guild?.id || undefined,
+        channelId: parentChannelId || undefined,
+        threadId: threadId,
+        contextMemory: true,
+        language: 'en',
+        customSystemPrompt: 'Provide a detailed, step-by-step explanation with specific examples. Focus on practical implementation and common pitfalls to avoid.'
+      });
+
+      const result = await queueService.processJob(jobId);
+      
+      if (!result) {
+        throw new Error('Failed to process clarification request');
+      }
+
+      const { EmbedBuilder } = await import('discord.js');
+      const clarificationEmbed = new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle('💡 Detailed Explanation')
+        .setDescription(result.answer)
+        .setFooter({ text: 'FBA Boss Assistant • Detailed Clarification' })
+        .setTimestamp();
+
+      // Only add the original question field if we found one
+      if (originalQuestion) {
+        clarificationEmbed.addFields(
+          { name: '❓ Original Question', value: originalQuestion, inline: false }
+        );
+      }
+
+      await interaction.editReply({ embeds: [clarificationEmbed] });
+
+    } catch (error) {
+      logger.error('Error processing clarification request:', error);
+      await interaction.editReply({
+        content: '❌ Sorry, I encountered an error while generating the detailed explanation. Please try again later.'
+      });
+    }
+  }
+
+  private async handleSourcesButton(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferReply({ ephemeral: true });
+
+    const originalMessage = interaction.message;
+    const sourcesEmbed = originalMessage.embeds.find(embed => embed.title === '📚 Sources & References');
+    
+    if (!sourcesEmbed || !sourcesEmbed.description) {
+      await interaction.editReply({
+        content: '❌ No sources found for this response.'
+      });
+      return;
+    }
+
+    const { EmbedBuilder } = await import('discord.js');
+    const detailedSourcesEmbed = new EmbedBuilder()
+      .setColor(0x2F3136)
+      .setTitle('📖 Complete Source Details')
+      .setDescription(sourcesEmbed.description)
+      .addFields(
+        { 
+          name: '💡 How to Use These Sources', 
+          value: '• Review the lesson content in the order listed\n• Pay attention to timestamps for video content\n• Cross-reference multiple sources for comprehensive understanding\n• Take notes on key concepts mentioned', 
+          inline: false 
+        }
+      )
+      .setFooter({ text: 'FBA Boss Academy • Course Materials' })
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [detailedSourcesEmbed] });
+  }
+
+  private async handleModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    if (interaction.customId === 'followup_modal') {
+      await this.handleFollowUpModal(interaction);
+    } else {
+      await interaction.reply({
+        content: '❌ Unknown modal submission.',
+        ephemeral: true
+      });
+    }
+  }
+
+  private async handleFollowUpModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const followUpQuestion = interaction.fields.getTextInputValue('followup_question');
+    
+    if (!this.isChannelAllowedForModal(interaction)) {
+      await interaction.reply({
+        content: '❌ This action can only be performed in the designated support channel or its threads.',
+        ephemeral: true
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: false });
+
+    const { SimpleQueueService } = await import('./simple-queue');
+    const queueService = new SimpleQueueService();
+
+    try {
+      // Determine if we're in a thread
+      const channel = interaction.channel;
+      const isThread = channel?.type === ChannelType.PrivateThread || channel?.type === ChannelType.PublicThread;
+      const threadId = isThread ? channel?.id : undefined;
+      const parentChannelId = isThread ? channel?.parentId : channel?.id;
+
+      const jobId = await queueService.addQAJob({
+        question: followUpQuestion,
+        userId: interaction.user.id,
+        guildId: interaction.guild?.id || undefined,
+        channelId: parentChannelId || undefined,
+        threadId: threadId,
+        contextMemory: true,
+        language: 'en'
+      });
+
+      const result = await queueService.processJob(jobId);
+      
+      if (!result) {
+        throw new Error('Failed to process follow-up question');
+      }
+
+      const confidencePercent = Math.round(result.confidence * 100);
+      
+      const sourcesText = result.sources.length > 0 
+        ? result.sources.slice(0, 3).map((source, index) => {
+            const lessonTitle = source.metadata.lessonTitle || source.metadata.lesson || source.title || 'Untitled Lesson';
+            const concept = source.metadata.concept ? ` - ${source.metadata.concept}` : '';
+            const unitInfo = source.metadata.unitTitle || (source.metadata.unit ? `Unit ${source.metadata.unit}` : '');
+            const timestamp = source.metadata.timestamp ? ` [${source.metadata.timestamp}]` : '';
+            
+            let sourceStr = `**${index + 1}. ${lessonTitle}${concept}**`;
+            
+            if (unitInfo) {
+              sourceStr += `\n📍 ${unitInfo}`;
+            }
+            
+            if (timestamp) {
+              sourceStr += `${timestamp}`;
+            }
+            
+            return sourceStr;
+          }).join('\n\n')
+        : 'No specific sources found in the knowledge base.';
+
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = await import('discord.js');
+      
+      const responseEmbed = new EmbedBuilder()
+        .setColor(confidencePercent >= 80 ? 0x00FF00 : confidencePercent >= 60 ? 0xFFFF00 : 0xFF6600)
+        .setTitle('💡 Follow-up Answer')
+        .setDescription(`<@${interaction.user.id}> ${result.answer}`)
+        .addFields(
+          { name: '❓ Your Follow-up Question', value: followUpQuestion, inline: false }
+        )
+        .setFooter({ text: 'FBA Boss Assistant • Follow-up Response' })
+        .setTimestamp();
+
+      const sourcesEmbed = new EmbedBuilder()
+        .setColor(0x2F3136)
+        .setTitle('📚 Sources & References')
+        .setDescription(sourcesText);
+
+      const actionRow = new ActionRowBuilder<any>()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId('ask_followup')
+            .setLabel('Another Follow-up')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('💬'),
+          new ButtonBuilder()
+            .setCustomId('ask_clarify')
+            .setLabel('Need Clarification?')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('❓'),
+          new ButtonBuilder()
+            .setCustomId('ask_sources')
+            .setLabel('View Full Sources')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('📖')
+        );
+
+      await interaction.editReply({ 
+        embeds: [responseEmbed, sourcesEmbed],
+        components: [actionRow]
+      });
+
+      logger.info(`Follow-up question answered for user ${interaction.user.username}: ${followUpQuestion} (${confidencePercent}% confidence)`);
+
+    } catch (error) {
+      logger.error('Error processing follow-up question:', error);
+      await interaction.editReply({
+        content: '❌ Sorry, I encountered an error while processing your follow-up question. Please try again later.'
+      });
+    }
+  }
+
+  private isChannelAllowed(interaction: ChatInputCommandInteraction | ButtonInteraction): boolean {
+    const channel = interaction.channel;
+    
+    if (!channel) {
+      return false;
+    }
+
+    // Allow in all channels - permissions managed through Discord
+    return true;
+  }
+
+  private isChannelAllowedForModal(interaction: ModalSubmitInteraction): boolean {
+    const channel = interaction.channel;
+    
+    if (!channel) {
+      return false;
+    }
+
+    // Allow in all channels - permissions managed through Discord
+    return true;
   }
 
   private async onGuildCreate(guild: Guild): Promise<void> {
