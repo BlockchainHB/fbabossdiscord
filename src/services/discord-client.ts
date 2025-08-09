@@ -103,7 +103,7 @@ export class DiscordClientService {
     // Check if command is restricted to production channel or its threads
     if (!this.isChannelAllowed(interaction)) {
       await interaction.reply({
-        content: '❌ This command can only be used in the designated support channel or its threads.',
+        content: '❌ The /ask command is disabled in this channel. Please use it in another channel.',
         ephemeral: true
       });
       return;
@@ -414,7 +414,13 @@ export class DiscordClientService {
       return false;
     }
 
-    // Allow in all channels - permissions managed through Discord
+    // Disable /ask in a specific channel
+    if ('commandName' in interaction) {
+      if (interaction.commandName === 'ask' && interaction.channel?.id === '1396670324250247179') {
+        return false;
+      }
+    }
+
     return true;
   }
 
